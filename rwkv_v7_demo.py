@@ -33,9 +33,13 @@ HEAD_SIZE = args.head_size_a
 USE_CUDA_KERNEL = False # False => UNOPTIMIZED, VERY SLOW
 
 
-MyModule = torch.jit.ScriptModule
-MyFunction = torch.jit.script_method
-MyStatic = torch.jit.script
+# MyModule = torch.jit.ScriptModule
+# MyFunction = torch.jit.script_method
+# MyStatic = torch.jit.script
+MyModule = nn.Module
+def __nop(ob): return ob
+MyFunction = __nop
+MyStatic = __nop
 
 ########################################################################################################
 # CUDA Kernel
@@ -342,20 +346,24 @@ if __name__ == '__main__':
 
 
     with torch.no_grad():
-
-        model = RWKV(args).to(dtype=DTYPE).to(DEVICE)
-        model.load_state_dict(model_params, strict=False) # we will ignore blocks.0.att.v0/v1/v2
-
-        ########################################################################################################
-
+        
         prompt = "The Eiffel tower is in the city of"
         input_ids_list = tokenizer.encode(prompt)
         print(f'\nInput:\n{input_ids_list}')
 
-        input_ids = torch.tensor(input_ids_list).reshape(1,-1).to('cpu')
-        onnx_model = torch.onnx.export(model, (input_ids_list, ))
+        input_ids = torch.tensor(input_ids_list).reshape(1,-1)
 
-        init_out = model.forward(torch.tensor(input_ids).reshape(1,-1).to(DEVICE))
+        model = RWKV(args)
+        onnx_model = torch.onnx.export(model, (input_ids, ))
+        model = model.to(dtype=DTYPE).to(DEVICE)
+        input_ids = input_ids.to(dtype=DTYPE).to(DEVICE)
+        
+        model.load_state_dict(model_params, strict=False) # we will ignore blocks.0.att.v0/v1/v2
+
+        ########################################################################################################
+
+
+        init_out = model.forward(input_ids)
         print(f'\nOutput:\n{init_out}')
 
         # logits of the last token => prediction for the next token    
