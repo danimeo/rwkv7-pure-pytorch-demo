@@ -10,12 +10,20 @@ import numpy as np
 np.set_printoptions(precision=4, suppress=True, linewidth=200)
 import types, torch, copy, time
 from typing import List
-torch.backends.cudnn.benchmark = True
-torch.backends.cudnn.allow_tf32 = True
-torch.backends.cuda.matmul.allow_tf32 = True
-# torch.backends.cuda.matmul.allow_fp16_reduced_precision_reduction = True
-# torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction = True
+
+
+DTYPE = torch.half
+DEVICE_TYPE = 'cuda'
+DEVICE = torch.device(DEVICE_TYPE)
+
+if DEVICE.type == DEVICE_TYPE:
+    torch.backends.cudnn.benchmark = True
+    torch.backends.cudnn.allow_tf32 = True
+    torch.backends.cuda.matmul.allow_tf32 = True
+    # torch.backends.cuda.matmul.allow_fp16_reduced_precision_reduction = True
+    # torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction = True
 torch._C._jit_set_autocast_mode(False)
+
 
 import torch.nn as nn
 from torch.nn import functional as F
@@ -34,7 +42,7 @@ args = types.SimpleNamespace()
 
 # model download: https://huggingface.co/BlinkDL/rwkv-7-pile
 
-args.MODEL_NAME = '/home/danim/RWKV-x070-World-1.5B-v3-20250127-ctx4096'
+args.MODEL_NAME = '/data/RWKV-x070-World-1.5B-v3-20250127-ctx4096'
 # args.MODEL_NAME = "/mnt/program/RWKV-x070-Pile-421M-20241127-ctx4096"
 
 if '168M' in args.MODEL_NAME or '0.1B' in args.MODEL_NAME:
@@ -62,28 +70,68 @@ TOP_P = 0.3
 #
 ########################################################################################################
 
-DTYPE = torch.half
 
 from torch.utils.cpp_extension import load
 HEAD_SIZE = args.head_size
 
-load(name="wkv7s", sources=["cuda/wkv7s_op.cpp", f"cuda/wkv7s.cu"], is_python_module=False,
-                    verbose=True, extra_cuda_cflags=["-res-usage", "--use_fast_math", "-O3", "-Xptxas -O3", "--extra-device-vectorization", f"-D_N_={HEAD_SIZE}"])
-class WKV_7(torch.autograd.Function):
-    @staticmethod
-    def forward(ctx, state, r, w, k, v, a, b):
-        with torch.no_grad():
-            T, C = r.size()
-            H = C // HEAD_SIZE
-            N = HEAD_SIZE
-            assert HEAD_SIZE == C // H
-            assert all(x.dtype == DTYPE for x in [r,w,k,v,a,b])
-            assert all(x.is_contiguous() for x in [r,w,k,v,a,b])
-            y = torch.empty((T, C), device=k.device, dtype=DTYPE, requires_grad=False, memory_format=torch.contiguous_format)
-            torch.ops.wkv7s.forward(1, T, C, H, state, r, w, k, v, a, b, y)
-            return y
-def RWKV7_OP(state, r, w, k, v, a, b):
-    return WKV_7.apply(state, r, w, k, v, a, b)
+# load(name="wkv7s", sources=["cuda/wkv7s_op.cpp", f"cuda/wkv7s.cu"], is_python_module=False,
+#                     verbose=True, extra_cuda_cflags=["-res-usage", "--use_fast_math", "-O3", "-Xptxas -O3", "--extra-device-vectorization", f"-D_N_={HEAD_SIZE}"])
+# class WKV_7(torch.autograd.Function):
+#     @staticmethod
+#     def forward(ctx, state, r, w, k, v, a, b):
+#         with torch.no_grad():
+#             T, C = r.size()
+#             H = C // HEAD_SIZE
+#             N = HEAD_SIZE
+#             assert HEAD_SIZE == C // H
+#             assert all(x.dtype == DTYPE for x in [r,w,k,v,a,b])
+#             assert all(x.is_contiguous() for x in [r,w,k,v,a,b])
+#             y = torch.empty((T, C), device=k.device, dtype=DTYPE, requires_grad=False, memory_format=torch.contiguous_format)
+#             torch.ops.wkv7s.forward(1, T, C, H, state, r, w, k, v, a, b, y)
+#             return y
+# def RWKV7_OP(state, r, w, k, v, a, b):
+#     return WKV_7.apply(state, r, w, k, v, a, b)
+
+@MyStatic
+def RWKV7_OP_SEQ(state, r, w, k, v, a, b):
+    DEVICE = torch.device('cuda')
+    DTYPE = torch.half
+    HEAD_SIZE = 64
+
+    T, C = r.size()
+    H = C // HEAD_SIZE
+    N = HEAD_SIZE
+    r = r.view(T, H, N).to(dtype=DTYPE)
+    k = k.view(T, H, N).to(dtype=DTYPE)
+    v = v.view(T, H, N).to(dtype=DTYPE)
+    a = a.view(T, H, N).to(dtype=DTYPE)
+    b = b.view(T, H, N).to(dtype=DTYPE)
+    w = torch.exp(-torch.exp(w.view(T, H, N).to(dtype=DTYPE)))
+    out = torch.zeros(T, H, N, device=DEVICE, dtype=DTYPE)
+    # state = torch.zeros(H, N, N, device=r.device, dtype=DTYPE)
+
+    for t in range(T):
+        print(k.size())
+        kk = k[t, :, :].view(H, 1, N)
+        rr = r[t, :, :].view(H, N, 1)
+        vv = v[t, :, :].view(H, N, 1)
+        aa = a[t, :, :].view(H, N, 1)
+        bb = b[t, :, :].view(H, 1, N)
+        state = state * w[t, :, :] + state @ aa @ bb + vv @ kk
+        out[t, :, :] = (state @ rr).view(H, N)
+
+        # another method using einsum
+        #
+        # kk = k[t, :, :]
+        # rr = r[t, :, :]
+        # vv = v[t, :, :]
+        # aa = a[t, :, :]
+        # bb = b[t, :, :]
+        # sab = torch.einsum('bhik,bhk,bhj->bhij', state, aa, bb)
+        # state = state * w[t, :, :, None, :] + sab + torch.einsum('bhj,bhi->bhij', kk, vv)
+        # out[t, :, :] = torch.einsum('bhj,bhij->bhi', rr, state)
+
+    return out.view(T, C).to(dtype=DTYPE)
 
 ########################################################################################################
 
@@ -95,7 +143,7 @@ class RWKV_x070(MyModule):
         self.n_layer = args.n_layer
         self.eval()
         
-        self.z = torch.load(args.MODEL_NAME + '.pth', map_location='cuda')
+        self.z = torch.load(args.MODEL_NAME + '.pth', map_location=DEVICE)
         z = self.z
         self.n_head, self.head_size = z['blocks.0.att.r_k'].shape
 
@@ -116,9 +164,9 @@ class RWKV_x070(MyModule):
         if state == None:
             state = [None for _ in range(args.n_layer * 3)]
             for i in range(args.n_layer): # state: 0=att_x_prev 1=att_kv 2=ffn_x_prev
-                state[i*3+0] = torch.zeros(args.n_embd, dtype=DTYPE, requires_grad=False, device="cuda")
-                state[i*3+1] = torch.zeros((args.n_embd // args.head_size, args.head_size, args.head_size), dtype=torch.float, requires_grad=False, device="cuda")
-                state[i*3+2] = torch.zeros(args.n_embd, dtype=DTYPE, requires_grad=False, device="cuda")
+                state[i*3+0] = torch.zeros(args.n_embd, dtype=DTYPE, requires_grad=False, device=DEVICE)
+                state[i*3+1] = torch.zeros((args.n_embd // args.head_size, args.head_size, args.head_size), dtype=DTYPE, requires_grad=False, device=DEVICE)
+                state[i*3+2] = torch.zeros(args.n_embd, dtype=DTYPE, requires_grad=False, device=DEVICE)
 
         if type(idx) is list:
             if len(idx) > 1:
@@ -195,6 +243,9 @@ class RWKV_x070(MyModule):
 
 @MyStatic
 def RWKV_x070_TMix_one(layer_id: int, H:int, N:int, x, x_prev, v_first, state, x_r, x_w, x_k, x_v, x_a, x_g, w0, w1, w2, a0, a1, a2, v0, v1, v2, g1, g2, k_k, k_a, r_k, R_, K_, V_, O_, ln_w, ln_b):
+    DEVICE = torch.device('cuda')
+    DTYPE = torch.half
+
     xx = x_prev - x
     xr, xw, xk, xv, xa, xg = x+xx*x_r, x+xx*x_w, x+xx*x_k, x+xx*x_v, x+xx*x_a, x+xx*x_g
 
@@ -209,11 +260,11 @@ def RWKV_x070_TMix_one(layer_id: int, H:int, N:int, x, x_prev, v_first, state, x
     k = k * (1 + (a-1) * k_a)
     if layer_id == 0: v_first = v
     else: v = v + (v_first - v) * torch.sigmoid(v0 + (xv @ v1) @ v2)
-    w = torch.exp(-0.606531 * torch.sigmoid((w0 + w).float())) # 0.606531 = exp(-0.5)
+    w = torch.exp(-0.606531 * torch.sigmoid((w0 + w).to(device=DEVICE, dtype=DTYPE))) # 0.606531 = exp(-0.5)
 
     vk = v.view(H,N,1) @ k.view(H,1,N)
     ab = (-kk).view(H,N,1) @ (kk*a).view(H,1,N)
-    state = state * w.view(H,1,N) + state @ ab.float() + vk.float()
+    state = state * w.view(H,1,N) + state @ ab.to(dtype=DTYPE) + vk.to(dtype=DTYPE)
     xx = (state.to(dtype=x.dtype) @ r.view(H,N,1))
 
     xx = torch.nn.functional.group_norm(xx.view(1,H*N), num_groups=H, weight=ln_w, bias=ln_b, eps = 64e-5).view(H*N)    
@@ -224,10 +275,12 @@ def RWKV_x070_TMix_one(layer_id: int, H:int, N:int, x, x_prev, v_first, state, x
 def RWKV_x070_TMix_seq(layer_id: int, H:int, N:int, x, x_prev, v_first, state, x_r, x_w, x_k, x_v, x_a, x_g, w0, w1, w2, a0, a1, a2, v0, v1, v2, g1, g2, k_k, k_a, r_k, R_, K_, V_, O_, ln_w, ln_b):
     T = x.shape[0]
     xx = torch.cat((x_prev.unsqueeze(0), x[:-1,:])) - x
+
     xr, xw, xk, xv, xa, xg = x+xx*x_r, x+xx*x_w, x+xx*x_k, x+xx*x_v, x+xx*x_a, x+xx*x_g
 
     r = xr @ R_
-    w = torch.tanh(xw @ w1) @ w2
+    print(xw.size(), w1.size(), w2.size())
+    w = torch.tanh(xw @ w1) @ w2  # w1, w2: LayerNorm params w, b
     k = xk @ K_
     v = xv @ V_
     a = torch.sigmoid(a0 + (xa @ a1) @ a2)
@@ -239,16 +292,19 @@ def RWKV_x070_TMix_seq(layer_id: int, H:int, N:int, x, x_prev, v_first, state, x
     else: v = v + (v_first - v) * torch.sigmoid(v0 + (xv @ v1) @ v2)
 
     ######## cuda-free method 
-    # w = torch.exp(-0.606531 * torch.sigmoid((w0 + w).float())) # 0.606531 = exp(-0.5)
+    # w = torch.exp(-0.606531 * torch.sigmoid((w0 + w).to(dtype=DTYPE))) # 0.606531 = exp(-0.5)
     # for t in range(T):
     #     r_, w_, k_, v_, kk_, a_ = r[t], w[t], k[t], v[t], kk[t], a[t]
     #     vk = v_.view(H,N,1) @ k_.view(H,1,N)
     #     ab = (-kk_).view(H,N,1) @ (kk_*a_).view(H,1,N)
-    #     state = state * w_.view(H,1,N) + state @ ab.float() + vk.float()
+    #     state = state * w_.view(H,1,N) + state @ ab..to(dtype=DTYPE) + vk.to(dtype=DTYPE)
     #     xx[t] = (state.to(dtype=x.dtype) @ r_.view(H,N,1)).view(H*N)
 
     w = -torch.nn.functional.softplus(-(w0 + w)) - 0.5
-    xx = RWKV7_OP(state, r, w, k, v, -kk, kk*a)
+    for x in (state, r, w, k, v, -kk, kk*a):
+        print(x.size() if isinstance(x, torch.Tensor) else x)
+    xx = RWKV7_OP_SEQ(state, r, w, k, v, -kk, kk*a)
+    print('xx', xx.size())
 
     xx = torch.nn.functional.group_norm(xx.view(T,H*N), num_groups=H, weight=ln_w, bias=ln_b, eps = 64e-5).view(T,H*N)
     xx = xx + ((r * k * r_k).view(T,H,N).sum(dim=-1, keepdim=True) * v.view(T,H,N)).view(T,H*N)
@@ -278,7 +334,9 @@ def RWKV_x070_CMix_seq(x, x_prev, x_k, K_, V_):
 
 @MyStatic
 def sample_logits(logits, temperature:float=1.0, top_p:float=1.0, top_k:int=0):
-    probs = F.softmax(logits.float(), dim=-1)
+    DTYPE = torch.half
+
+    probs = F.softmax(logits.to(dtype=DTYPE), dim=-1)
     sorted_probs, sorted_ids = torch.sort(probs, descending=True)
     
     if top_k > 0:
@@ -303,19 +361,17 @@ def sample_logits(logits, temperature:float=1.0, top_p:float=1.0, top_k:int=0):
 
 ########################################################################################################
 
-# from tokenizers import Tokenizer
-# tokenizer = Tokenizer.from_file("../RWKV-v4neo/20B_tokenizer.json")
 
 from tokenizer.rwkv_tokenizer import TRIE_TOKENIZER
-tokenizer = TRIE_TOKENIZER('/home/danim/RWKV-LM-main/RWKV-v7/tokenizer/rwkv_vocab_v20230424.txt')
+tokenizer = TRIE_TOKENIZER('tokenizer/rwkv_vocab_v20230424.txt')
 
-
-print(f'\nUsing CUDA {str(DTYPE).replace("torch.","")}. Loading {args.MODEL_NAME} ...')
+print(f'\nUsing {DEVICE} {str(DTYPE).replace("torch.","")}. Loading {args.MODEL_NAME} ...')
 model = RWKV_x070(args)
 
+print(tokenizer.encode(prompt))
 init_out, init_state = model.forward(tokenizer.encode(prompt), None)
     
-probs = F.softmax(init_out.float(), dim=-1) # compute softmax in float (more accurate)
+probs = F.softmax(init_out.to(dtype=DTYPE), dim=-1) # compute softmax in float (more accurate)
 
 print(f'\n{prompt}')
 
@@ -354,7 +410,8 @@ for TRIAL in range(NUM_TRIALS):
 
         out, state = model.forward(token, state)
         
-        torch.cuda.synchronize()
+        if DEVICE.type == DEVICE_TYPE:
+            torch.cuda.synchronize()
         t1 = time.perf_counter()
         min_time = min(min_time, t1 - t0)
         min_time_all = min(min_time_all, t1 - t00)
@@ -384,7 +441,7 @@ print('\n')
 #     out, _ = model.forward(src+dst, None, full_output=True)
 
 #     for i in range(len(dst)):
-#         ooo = out[len(src)-1+i].float()
+#         ooo = out[len(src)-1+i].to(dtype=DTYPE)()
 #         probs = F.softmax(ooo, dim=-1)
 #         logits += math.log(probs[dst[i]])
 #         if torch.argmax(probs).item() != dst[i]:

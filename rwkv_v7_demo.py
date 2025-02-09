@@ -4,6 +4,8 @@
 
 ########################################################################################################
 
+import copy
+import time
 import torch, types, os, gc, math, json
 import numpy as np
 import torch.nn as nn
@@ -20,7 +22,7 @@ torch._C._jit_set_autocast_mode(False)
 This will load RWKV-7 "Goose" x070 and inference in GPT-mode (slower than RNN-mode for autoregressive generation)
 '''
 
-DEVICE = torch.device('cpu')
+DEVICE = torch.device('cuda')
 # DTYPE = torch.bfloat16
 DTYPE = torch.half # better
 
@@ -295,7 +297,7 @@ if __name__ == '__main__':
     # model download: https://huggingface.co/BlinkDL/rwkv-7-pile
 
     # args.MODEL_NAME = '/home/danim/RWKV-x070-World-1.5B-v3-20250127-ctx4096.pth'
-    args.MODEL_NAME = '/home/danim/RWKV-x070-World-1.5B-v3-20250127-ctx4096.pth'
+    args.MODEL_NAME = '/data/RWKV-x070-World-1.5B-v3-20250127-ctx4096.pth'
     MODEL_PATH = args.MODEL_NAME
 
     if '168M' in MODEL_PATH:
@@ -334,7 +336,7 @@ if __name__ == '__main__':
     # tokenizer = Tokenizer.from_file("../RWKV-v4neo/20B_tokenizer.json")
 
     from tokenizer.rwkv_tokenizer import TRIE_TOKENIZER
-    tokenizer = TRIE_TOKENIZER('/home/danim/RWKV-LM-main/RWKV-v7/tokenizer/rwkv_vocab_v20230424.txt')
+    tokenizer = TRIE_TOKENIZER('./tokenizer/rwkv_vocab_v20230424.txt')
 
     model_params = torch.load(MODEL_PATH, map_location=DEVICE)
 
@@ -350,16 +352,16 @@ if __name__ == '__main__':
         input_ids_list = tokenizer.encode(prompt)
         print(f'\nInput:\n{input_ids_list}')
 
-        input_ids = torch.tensor(input_ids_list).reshape(1,-1).to(DEVICE)
-        onnx_model = torch.onnx.export(model, (input_ids,))
+        input_ids = torch.tensor(input_ids_list).reshape(1,-1).to('cpu')
+        onnx_model = torch.onnx.export(model, (input_ids_list, ))
 
-        out = model.forward(torch.tensor(input_ids).reshape(1,-1).to(DEVICE))
-        print(f'\nOutput:\n{out}')
+        init_out = model.forward(torch.tensor(input_ids).reshape(1,-1).to(DEVICE))
+        print(f'\nOutput:\n{init_out}')
 
         # logits of the last token => prediction for the next token    
-        out = out[0, -1]
+        init_out = init_out[0, -1]
         
-        probs = F.softmax(out.float(), dim=-1) # compute softmax in float (more accurate)
+        probs = F.softmax(init_out.float(), dim=-1) # compute softmax in float (more accurate)
 
         print(f'\n{prompt}')
 
@@ -372,30 +374,38 @@ if __name__ == '__main__':
 
         ########################################################################################################
 
-        # with open(f"misc/lambada_test.jsonl", "r", encoding="utf-8") as f:
-        #     todo = [json.loads(line) for line in f]
-        #     todo = [[doc['text'].rsplit(' ', 1)[0], " " + doc['text'].rsplit(' ', 1)[1]] for doc in todo]
+        for TRIAL in range(NUM_TRIALS):
+            print(f'\n\n--[ Trial {TRIAL} ]-----------------', prompt, end="")
+            all_tokens = []
+            out_last = 0
+            out = init_out.clone()
 
-        # print('\nCheck LAMBADA...')
-        # xsum = 0
-        # xcnt = 0
-        # xacc = 0
-        # for d in todo:
-        #     src = [0] + tokenizer.encode(d[0]).ids
-        #     dst = tokenizer.encode(d[1]).ids
+            min_time = 1e10
+            min_time_all = 1e10
 
-        #     logits = 0
-        #     correct = True
-        #     out = model.forward(torch.tensor(src+dst).reshape(1,-1).cuda())
-        #     for i in range(len(dst)):
-        #         ooo = out[0,len(src)-1+i].float()
-        #         probs = F.softmax(ooo, dim=-1)
-        #         logits += math.log(probs[dst[i]])
-        #         if torch.argmax(probs).item() != dst[i]:
-        #             correct = False
+            t000 = time.perf_counter()
 
-        #     xcnt += 1
-        #     xsum += logits
-        #     xacc += 1 if correct else 0
-        #     if xcnt % 100 == 0 or xcnt == len(todo):
-        #         print(xcnt, 'ppl', round(math.exp(-xsum / xcnt), 2), 'acc', round(xacc/xcnt*100, 2))
+            for i in range(LENGTH_PER_TRIAL):
+                t00 = time.perf_counter()
+                token = sample_logits(out, TEMPERATURE, TOP_P)
+                all_tokens += [token]
+                try:
+                    tmp = tokenizer.decode(all_tokens[out_last:])
+                    if '\ufffd' not in tmp: # only print when we have a valid utf-8 string
+                        print(tmp, end="", flush=True)
+                        out_last = i + 1
+                except:
+                    pass
+                t0 = time.perf_counter()
+
+                out = model.forward(token)
+                
+                torch.cuda.synchronize()
+                t1 = time.perf_counter()
+                min_time = min(min_time, t1 - t0)
+                min_time_all = min(min_time_all, t1 - t00)
+            
+            print(f'\n[ {round(1/min_time_all,2)} (real) / {round(1/min_time,2)} (ignore sampling & tokenizer) token/s = {round(time.perf_counter()-t000,3)}s ]', end='')
+
+        print('\n')
+
