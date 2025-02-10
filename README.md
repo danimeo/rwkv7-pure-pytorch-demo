@@ -1,5 +1,5 @@
 
-**Includes errors, not ready for use**
+**Contains errors, not ready for use**
 
 ---
 Just another version of pytorch implementation of RWKV-7, currently for my personal use.
