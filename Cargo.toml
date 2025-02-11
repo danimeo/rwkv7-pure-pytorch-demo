@@ -1,0 +1,44 @@
+[workspace.package]
+# name = "lifepulse"
+version = "0.1.0"
+edition = "2021"
+authors = ["Danim <danimeon@outlook.com>"]
+categories = ["science", "text-processing"]
+description = "An implementation of the RWKV language model in pure WebGPU."
+exclude = ["assets/", "screenshots/"]
+homepage = "https://github.com/cryscan/web-rwkv"
+keywords = ["rwkv"]
+license = "MIT"
+# repository = ""
+rust-version = "1.83.0"
+
+[package]
+name = "lifepulse"
+authors.workspace = true
+categories.workspace = true
+description.workspace = true
+edition.workspace = true
+exclude = ["assets/", "crates/", "screenshots/"]
+homepage.workspace = true
+keywords.workspace = true
+license.workspace = true
+# repository.workspace = true
+version.workspace = true
+
+
+[dependencies]
+anyhow = "1.0"  # For error handling
+clap = { version = "4.0", features = ["derive"] }  # For command-line argument parsing
+dialoguer = "0.10"  # For interactive prompts (used conditionally)
+half = "2.0"  # For half-precision floating-point support
+itertools = "0.10"  # For additional iterator functionality
+memmap2 = "0.5"  # For memory-mapped file I/O
+safetensors = "0.5"  # For safe tensor deserialization
+serde = { version = "1.0", features = ["derive"] }  # For serialization/deserialization
+serde_json = "1.0"  # For JSON parsing
+tokio = { version = "1.0", features = ["full"] }  # For asynchronous runtime
+web-rwkv = "0.10.10"  # For the RWKV model runtime and utilities
+fastrand = "1.0"  # For random number generation
+simple_logger = "4.0"  # For logging
+log = "0.4"  # For logging macros
+wgpu = "24.0.1"
