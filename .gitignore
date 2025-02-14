@@ -1,7 +1,7 @@
 /target
 node_modules/
 package-lock.json
-.create-qwik-20jn0m142a5/
+/.create-qwik-*
 
 # Build
 /dist
